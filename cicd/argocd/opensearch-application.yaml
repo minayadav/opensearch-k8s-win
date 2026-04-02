@@ -1,0 +1,71 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: opensearch
+  namespace: argocd
+  # Finalizer ensures proper cleanup
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # Project name
+  project: default
+  
+  # Source repository configuration
+  source:
+    # Git repository URL
+    repoURL: https://github.com/minayadav/opensearch-k8s-win.git
+    targetRevision: HEAD
+    path: k8s-manifests
+    
+    # Directory configuration
+    directory:
+      recurse: true
+      # Apply manifests in order
+      include: '*.yaml'
+  
+  # Destination cluster and namespace
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: opensearch
+  
+  # Sync policy configuration
+  syncPolicy:
+    # Automated sync configuration
+    automated:
+      # Automatically sync when Git changes detected
+      prune: true        # Delete resources that are no longer in Git
+      selfHeal: true     # Automatically sync when cluster state differs from Git
+      allowEmpty: false  # Don't sync if no resources found
+    
+    # Sync options
+    syncOptions:
+      - CreateNamespace=true  # Create namespace if it doesn't exist
+      - PrunePropagationPolicy=foreground  # Delete resources in order
+      - PruneLast=true  # Prune resources after new resources are healthy
+      - RespectIgnoreDifferences=true
+      - ApplyOutOfSyncOnly=true
+    
+    # Retry configuration
+    retry:
+      limit: 5  # Number of retry attempts
+      backoff:
+        duration: 5s      # Initial retry delay
+        factor: 2         # Backoff factor
+        maxDuration: 3m   # Maximum retry delay
+  
+  # Ignore differences in certain fields
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+    - group: ""
+      kind: Service
+      jsonPointers:
+        - /spec/clusterIP
+        - /spec/clusterIPs
+  
+  # Health assessment configuration
+  revisionHistoryLimit: 10
+
+# Made with Bob

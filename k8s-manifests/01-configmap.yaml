@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensearch-config
+  namespace: opensearch
+data:
+  opensearch.yml: |
+    cluster.name: opensearch-cluster
+    network.host: 0.0.0.0
+    
+    # Discovery settings for single-node cluster
+    discovery.type: single-node
+    
+    # Disable security for local development (enable in production)
+    plugins.security.disabled: true
+    
+    # Performance optimizations for low memory
+    bootstrap.memory_lock: false
+    
+    # Reduce thread pools for memory efficiency
+    thread_pool.write.queue_size: 200
+    thread_pool.search.queue_size: 500
+    
+  jvm.options: |
+    ## JVM configuration optimized for 4GB Docker Desktop constraint
+    
+    ## Heap size - 512MB for stable operation
+    -Xms512m
+    -Xmx512m
+    
+    ## GC configuration for low memory
+    -XX:+UseG1GC
+    -XX:G1ReservePercent=25
+    -XX:InitiatingHeapOccupancyPercent=30
+    
+    ## Reduce metaspace
+    -XX:MaxMetaspaceSize=128m
+    
+    ## GC logging
+    -Xlog:gc*,gc+age=trace,safepoint:file=/usr/share/opensearch/logs/gc.log:utctime,pid,tags:filecount=2,filesize=64m
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensearch-dashboards-config
+  namespace: opensearch
+data:
+  opensearch_dashboards.yml: |
+    server.name: opensearch-dashboards
+    server.host: "0.0.0.0"
+    
+    # OpenSearch connection
+    opensearch.hosts: ["http://opensearch-service:9200"]
+    
+    # Disable security for local development
+    opensearch.ssl.verificationMode: none
+    
+    # Performance settings
+    logging.quiet: true
+    ops.interval: 30000
+
+# Made with Bob

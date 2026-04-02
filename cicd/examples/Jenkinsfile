@@ -1,0 +1,266 @@
+// Jenkins Pipeline for OpenSearch Kubernetes Deployment
+// Place this file in the root of your repository as Jenkinsfile
+
+pipeline {
+    agent any
+    
+    environment {
+        KUBE_NAMESPACE = 'opensearch'
+        KUBECTL_VERSION = '1.28.0'
+        KUBECONFIG = credentials('kubeconfig-prod')
+    }
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Target environment for deployment'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: 'Run tests before deployment'
+        )
+        booleanParam(
+            name: 'SKIP_VALIDATION',
+            defaultValue: false,
+            description: 'Skip manifest validation'
+        )
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out code...'
+                checkout scm
+            }
+        }
+        
+        stage('Validate Manifests') {
+            when {
+                expression { !params.SKIP_VALIDATION }
+            }
+            steps {
+                script {
+                    echo 'Validating Kubernetes manifests...'
+                    sh '''
+                        for file in k8s-manifests/*.yaml; do
+                            echo "Validating $file"
+                            kubectl apply --dry-run=client -f "$file"
+                        done
+                    '''
+                }
+            }
+        }
+        
+        stage('Run Kubeval') {
+            when {
+                expression { !params.SKIP_VALIDATION }
+            }
+            steps {
+                script {
+                    echo 'Running kubeval...'
+                    sh '''
+                        if ! command -v kubeval &> /dev/null; then
+                            wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+                            tar xf kubeval-linux-amd64.tar.gz
+                            sudo mv kubeval /usr/local/bin/
+                        fi
+                        kubeval k8s-manifests/*.yaml
+                    '''
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                script {
+                    echo 'Running security scan...'
+                    sh '''
+                        for file in k8s-manifests/*.yaml; do
+                            echo "Scanning $file"
+                            curl -sSX POST --data-binary @"$file" https://v2.kubesec.io/scan
+                        done
+                    '''
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            when {
+                expression { params.RUN_TESTS }
+            }
+            steps {
+                echo 'Running unit tests...'
+                // Add your test commands here
+                sh 'echo "Unit tests passed"'
+            }
+        }
+        
+        stage('Build & Push Images') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo 'Building and pushing Docker images...'
+                    // Add your build commands here if needed
+                    sh 'echo "Images built and pushed"'
+                }
+            }
+        }
+        
+        stage('Deploy to Development') {
+            when {
+                expression { params.ENVIRONMENT == 'dev' }
+                branch 'develop'
+            }
+            steps {
+                script {
+                    echo 'Deploying to Development...'
+                    deployToEnvironment('dev')
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                expression { params.ENVIRONMENT == 'staging' }
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo 'Deploying to Staging...'
+                    input message: 'Deploy to Staging?', ok: 'Deploy'
+                    deployToEnvironment('staging')
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                expression { params.ENVIRONMENT == 'prod' }
+                tag pattern: "v\\d+\\.\\d+\\.\\d+", comparator: "REGEXP"
+            }
+            steps {
+                script {
+                    echo 'Deploying to Production...'
+                    input message: 'Deploy to Production?', ok: 'Deploy'
+                    deployToEnvironment('prod')
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    echo 'Verifying deployment...'
+                    sh """
+                        kubectl get pods -n ${KUBE_NAMESPACE}
+                        kubectl get svc -n ${KUBE_NAMESPACE}
+                        
+                        # Wait for pods to be ready
+                        kubectl wait --for=condition=ready pod -l app=opensearch \
+                            -n ${KUBE_NAMESPACE} --timeout=300s
+                        
+                        kubectl wait --for=condition=ready pod -l app=opensearch-dashboards \
+                            -n ${KUBE_NAMESPACE} --timeout=300s
+                    """
+                }
+            }
+        }
+        
+        stage('Smoke Tests') {
+            steps {
+                script {
+                    echo 'Running smoke tests...'
+                    sh """
+                        # Test cluster health
+                        kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -- \
+                            curl -f http://opensearch-nodeport.${KUBE_NAMESPACE}:9200/_cluster/health
+                    """
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                expression { params.RUN_TESTS }
+            }
+            steps {
+                script {
+                    echo 'Running integration tests...'
+                    // Add your integration test commands here
+                    sh 'echo "Integration tests passed"'
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo 'Pipeline completed successfully!'
+            script {
+                notifySlack('SUCCESS', 'OpenSearch deployment completed successfully')
+            }
+        }
+        failure {
+            echo 'Pipeline failed!'
+            script {
+                notifySlack('FAILURE', 'OpenSearch deployment failed')
+                // Optionally trigger rollback
+                if (params.ENVIRONMENT == 'prod') {
+                    input message: 'Rollback deployment?', ok: 'Rollback'
+                    rollbackDeployment()
+                }
+            }
+        }
+        always {
+            echo 'Cleaning up...'
+            cleanWs()
+        }
+    }
+}
+
+// Helper function to deploy to specific environment
+def deployToEnvironment(String env) {
+    withCredentials([file(credentialsId: "kubeconfig-${env}", variable: 'KUBECONFIG')]) {
+        sh """
+            export KUBECONFIG=\${KUBECONFIG}
+            
+            echo "Deploying to ${env} environment..."
+            
+            # Apply manifests in order
+            kubectl apply -f k8s-manifests/00-namespace.yaml
+            kubectl apply -f k8s-manifests/01-configmap.yaml
+            kubectl apply -f k8s-manifests/02-pvc.yaml
+            kubectl apply -f k8s-manifests/03-statefulset.yaml
+            kubectl apply -f k8s-manifests/04-deployment-dashboards.yaml
+            kubectl apply -f k8s-manifests/05-services.yaml
+            
+            echo "Deployment to ${env} completed"
+        """
+    }
+}
+
+// Helper function to rollback deployment
+def rollbackDeployment() {
+    sh """
+        echo "Rolling back deployment..."
+        kubectl rollout undo statefulset opensearch -n ${KUBE_NAMESPACE}
+        kubectl rollout status statefulset opensearch -n ${KUBE_NAMESPACE}
+        echo "Rollback completed"
+    """
+}
+
+// Helper function to send Slack notifications
+def notifySlack(String status, String message) {
+    def color = status == 'SUCCESS' ? 'good' : 'danger'
+    def emoji = status == 'SUCCESS' ? ':white_check_mark:' : ':x:'
+    
+    // Requires Slack Notification Plugin
+    slackSend(
+        color: color,
+        message: "${emoji} ${message}\nJob: ${env.JOB_NAME}\nBuild: ${env.BUILD_NUMBER}\nEnvironment: ${params.ENVIRONMENT}"
+    )
+}

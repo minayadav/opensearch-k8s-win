@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch-service
+  namespace: opensearch
+  labels:
+    app: opensearch
+spec:
+  type: ClusterIP
+  ports:
+  - port: 9200
+    targetPort: 9200
+    protocol: TCP
+    name: http
+  - port: 9300
+    targetPort: 9300
+    protocol: TCP
+    name: transport
+  selector:
+    app: opensearch
+  clusterIP: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch-dashboards-service
+  namespace: opensearch
+  labels:
+    app: opensearch-dashboards
+spec:
+  type: NodePort
+  ports:
+  - port: 5601
+    targetPort: 5601
+    nodePort: 30561
+    protocol: TCP
+    name: http
+  selector:
+    app: opensearch-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch-external
+  namespace: opensearch
+  labels:
+    app: opensearch
+spec:
+  type: NodePort
+  ports:
+  - port: 9200
+    targetPort: 9200
+    nodePort: 30920
+    protocol: TCP
+    name: http
+  selector:
+    app: opensearch
+
+# Made with Bob

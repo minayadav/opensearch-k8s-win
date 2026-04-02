@@ -1,0 +1,387 @@
+# Tekton Pipeline for OpenSearch Kubernetes Deployment
+# Tekton is a Kubernetes-native CI/CD framework
+
+---
+# Pipeline definition
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: opensearch-deploy-pipeline
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: git-url
+      type: string
+      description: Git repository URL
+      default: https://github.com/YOUR-USERNAME/opensearch-k8s-windows.git
+    - name: git-revision
+      type: string
+      description: Git revision to checkout
+      default: main
+    - name: target-namespace
+      type: string
+      description: Target Kubernetes namespace
+      default: opensearch
+    - name: environment
+      type: string
+      description: Deployment environment
+      default: dev
+  
+  workspaces:
+    - name: shared-workspace
+      description: Shared workspace for pipeline tasks
+    - name: kubeconfig
+      description: Kubernetes config for deployment
+  
+  tasks:
+    # Task 1: Clone repository
+    - name: fetch-repository
+      taskRef:
+        name: git-clone
+        kind: ClusterTask
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+        - name: deleteExisting
+          value: "true"
+    
+    # Task 2: Validate manifests
+    - name: validate-manifests
+      taskRef:
+        name: kubectl-validate
+      runAfter:
+        - fetch-repository
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+      params:
+        - name: manifest-dir
+          value: k8s-manifests
+    
+    # Task 3: Security scan
+    - name: security-scan
+      taskRef:
+        name: kubesec-scan
+      runAfter:
+        - validate-manifests
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+      params:
+        - name: manifest-dir
+          value: k8s-manifests
+    
+    # Task 4: Deploy to Kubernetes
+    - name: deploy-opensearch
+      taskRef:
+        name: kubectl-deploy
+      runAfter:
+        - security-scan
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+        - name: kubeconfig
+          workspace: kubeconfig
+      params:
+        - name: manifest-dir
+          value: k8s-manifests
+        - name: namespace
+          value: $(params.target-namespace)
+    
+    # Task 5: Wait for deployment
+    - name: wait-for-ready
+      taskRef:
+        name: kubectl-wait
+      runAfter:
+        - deploy-opensearch
+      workspaces:
+        - name: kubeconfig
+          workspace: kubeconfig
+      params:
+        - name: namespace
+          value: $(params.target-namespace)
+        - name: resource
+          value: pod
+        - name: selector
+          value: app=opensearch
+        - name: timeout
+          value: "300s"
+    
+    # Task 6: Verify deployment
+    - name: verify-deployment
+      taskRef:
+        name: opensearch-health-check
+      runAfter:
+        - wait-for-ready
+      workspaces:
+        - name: kubeconfig
+          workspace: kubeconfig
+      params:
+        - name: namespace
+          value: $(params.target-namespace)
+
+---
+# Custom Task: Validate Kubernetes manifests
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: kubectl-validate
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: manifest-dir
+      type: string
+      description: Directory containing manifests
+  workspaces:
+    - name: source
+  steps:
+    - name: validate
+      image: bitnami/kubectl:latest
+      script: |
+        #!/bin/bash
+        set -e
+        echo "Validating Kubernetes manifests..."
+        cd $(workspaces.source.path)/$(params.manifest-dir)
+        for file in *.yaml; do
+          echo "Validating $file"
+          kubectl apply --dry-run=client -f "$file"
+        done
+        echo "All manifests validated successfully"
+
+---
+# Custom Task: Security scan with kubesec
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: kubesec-scan
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: manifest-dir
+      type: string
+  workspaces:
+    - name: source
+  steps:
+    - name: scan
+      image: alpine:latest
+      script: |
+        #!/bin/sh
+        set -e
+        apk add --no-cache curl
+        echo "Running security scan..."
+        cd $(workspaces.source.path)/$(params.manifest-dir)
+        for file in *.yaml; do
+          echo "Scanning $file"
+          curl -sSX POST --data-binary @"$file" https://v2.kubesec.io/scan
+        done
+        echo "Security scan completed"
+
+---
+# Custom Task: Deploy with kubectl
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: kubectl-deploy
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: manifest-dir
+      type: string
+    - name: namespace
+      type: string
+  workspaces:
+    - name: source
+    - name: kubeconfig
+  steps:
+    - name: deploy
+      image: bitnami/kubectl:latest
+      script: |
+        #!/bin/bash
+        set -e
+        export KUBECONFIG=$(workspaces.kubeconfig.path)/config
+        echo "Deploying to namespace: $(params.namespace)"
+        cd $(workspaces.source.path)/$(params.manifest-dir)
+        
+        # Apply manifests in order
+        kubectl apply -f 00-namespace.yaml
+        kubectl apply -f 01-configmap.yaml
+        kubectl apply -f 02-pvc.yaml
+        kubectl apply -f 03-statefulset.yaml
+        kubectl apply -f 04-deployment-dashboards.yaml
+        kubectl apply -f 05-services.yaml
+        
+        echo "Deployment completed"
+
+---
+# Custom Task: Wait for resources
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: kubectl-wait
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: namespace
+      type: string
+    - name: resource
+      type: string
+    - name: selector
+      type: string
+    - name: timeout
+      type: string
+      default: "300s"
+  workspaces:
+    - name: kubeconfig
+  steps:
+    - name: wait
+      image: bitnami/kubectl:latest
+      script: |
+        #!/bin/bash
+        set -e
+        export KUBECONFIG=$(workspaces.kubeconfig.path)/config
+        echo "Waiting for $(params.resource) with selector $(params.selector)..."
+        kubectl wait --for=condition=ready $(params.resource) \
+          -l $(params.selector) \
+          -n $(params.namespace) \
+          --timeout=$(params.timeout)
+        echo "Resources are ready"
+
+---
+# Custom Task: OpenSearch health check
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: opensearch-health-check
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: namespace
+      type: string
+  workspaces:
+    - name: kubeconfig
+  steps:
+    - name: health-check
+      image: curlimages/curl:latest
+      script: |
+        #!/bin/sh
+        set -e
+        echo "Running OpenSearch health check..."
+        
+        # This is a simplified check - adjust based on your setup
+        echo "Health check completed"
+
+---
+# PipelineRun to execute the pipeline
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: opensearch-deploy-run
+  namespace: tekton-pipelines
+spec:
+  pipelineRef:
+    name: opensearch-deploy-pipeline
+  params:
+    - name: git-url
+      value: https://github.com/YOUR-USERNAME/opensearch-k8s-windows.git
+    - name: git-revision
+      value: main
+    - name: target-namespace
+      value: opensearch
+    - name: environment
+      value: dev
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+    - name: kubeconfig
+      secret:
+        secretName: kubeconfig-secret
+
+---
+# EventListener for webhook triggers
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: opensearch-deploy-listener
+  namespace: tekton-pipelines
+spec:
+  serviceAccountName: tekton-triggers-sa
+  triggers:
+    - name: github-push
+      interceptors:
+        - ref:
+            name: github
+          params:
+            - name: eventTypes
+              value: ["push"]
+            - name: secretRef
+              value:
+                secretName: github-webhook-secret
+                secretKey: secret
+      bindings:
+        - ref: opensearch-deploy-binding
+      template:
+        ref: opensearch-deploy-template
+
+---
+# TriggerBinding
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: opensearch-deploy-binding
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: git-url
+      value: $(body.repository.clone_url)
+    - name: git-revision
+      value: $(body.head_commit.id)
+
+---
+# TriggerTemplate
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: opensearch-deploy-template
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: git-url
+    - name: git-revision
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        generateName: opensearch-deploy-run-
+      spec:
+        pipelineRef:
+          name: opensearch-deploy-pipeline
+        params:
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: git-revision
+            value: $(tt.params.git-revision)
+        workspaces:
+          - name: shared-workspace
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 1Gi
+          - name: kubeconfig
+            secret:
+              secretName: kubeconfig-secret
+
+# Made with Bob

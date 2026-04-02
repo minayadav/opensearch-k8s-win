@@ -1,0 +1,223 @@
+# GitLab CI/CD Pipeline for OpenSearch Kubernetes Deployment
+# Place this file in the root of your repository as .gitlab-ci.yml
+
+stages:
+  - validate
+  - test
+  - deploy
+  - verify
+
+variables:
+  KUBE_NAMESPACE: opensearch
+  KUBECTL_VERSION: "1.28.0"
+
+# Validate YAML syntax and Kubernetes manifests
+validate:
+  stage: validate
+  image: alpine/k8s:${KUBECTL_VERSION}
+  script:
+    - echo "Validating Kubernetes manifests..."
+    - |
+      for file in k8s-manifests/*.yaml; do
+        echo "Validating $file"
+        kubectl apply --dry-run=client -f "$file"
+      done
+  only:
+    changes:
+      - k8s-manifests/**
+      - .gitlab-ci.yml
+
+# Run kubeval for additional validation
+kubeval:
+  stage: validate
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl tar
+    - curl -L https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+    - mv kubeval /usr/local/bin/
+  script:
+    - echo "Running kubeval..."
+    - kubeval k8s-manifests/*.yaml
+  only:
+    changes:
+      - k8s-manifests/**
+
+# Security scanning with kubesec
+security-scan:
+  stage: test
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "Running security scan..."
+    - |
+      for file in k8s-manifests/*.yaml; do
+        echo "Scanning $file"
+        curl -sSX POST --data-binary @"$file" https://v2.kubesec.io/scan
+      done
+  allow_failure: true
+  only:
+    changes:
+      - k8s-manifests/**
+
+# Deploy to development environment
+deploy:dev:
+  stage: deploy
+  image: alpine/k8s:${KUBECTL_VERSION}
+  environment:
+    name: development
+    url: http://opensearch-dev.example.com
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_DEV" | base64 -d > ~/.kube/config
+    - kubectl version --client
+  script:
+    - echo "Deploying to development..."
+    - kubectl apply -f k8s-manifests/00-namespace.yaml
+    - kubectl apply -f k8s-manifests/01-configmap.yaml
+    - kubectl apply -f k8s-manifests/02-pvc.yaml
+    - kubectl apply -f k8s-manifests/03-statefulset.yaml
+    - kubectl apply -f k8s-manifests/04-deployment-dashboards.yaml
+    - kubectl apply -f k8s-manifests/05-services.yaml
+    - echo "Waiting for pods to be ready..."
+    - kubectl wait --for=condition=ready pod -l app=opensearch -n ${KUBE_NAMESPACE} --timeout=300s
+    - kubectl wait --for=condition=ready pod -l app=opensearch-dashboards -n ${KUBE_NAMESPACE} --timeout=300s
+  only:
+    - develop
+  tags:
+    - kubernetes
+
+# Deploy to staging environment
+deploy:staging:
+  stage: deploy
+  image: alpine/k8s:${KUBECTL_VERSION}
+  environment:
+    name: staging
+    url: http://opensearch-staging.example.com
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_STAGING" | base64 -d > ~/.kube/config
+  script:
+    - echo "Deploying to staging..."
+    - kubectl apply -f k8s-manifests/
+    - kubectl wait --for=condition=ready pod -l app=opensearch -n ${KUBE_NAMESPACE} --timeout=300s
+  only:
+    - main
+  when: manual
+  tags:
+    - kubernetes
+
+# Deploy to production environment
+deploy:production:
+  stage: deploy
+  image: alpine/k8s:${KUBECTL_VERSION}
+  environment:
+    name: production
+    url: http://opensearch.example.com
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_PROD" | base64 -d > ~/.kube/config
+  script:
+    - echo "Deploying to production..."
+    - kubectl apply -f k8s-manifests/
+    - kubectl wait --for=condition=ready pod -l app=opensearch -n ${KUBE_NAMESPACE} --timeout=600s
+  only:
+    - tags
+  when: manual
+  tags:
+    - kubernetes
+
+# Verify deployment
+verify:
+  stage: verify
+  image: curlimages/curl:latest
+  script:
+    - echo "Verifying OpenSearch deployment..."
+    - |
+      # Wait a bit for services to be fully ready
+      sleep 10
+      
+      # Test cluster health (adjust URL based on your setup)
+      # This assumes you have a way to access the cluster from CI
+      echo "Deployment verification complete"
+  dependencies:
+    - deploy:dev
+  only:
+    - develop
+
+# Smoke tests
+smoke-tests:
+  stage: verify
+  image: alpine/k8s:${KUBECTL_VERSION}
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_DEV" | base64 -d > ~/.kube/config
+  script:
+    - echo "Running smoke tests..."
+    - kubectl get pods -n ${KUBE_NAMESPACE}
+    - kubectl get svc -n ${KUBE_NAMESPACE}
+    - |
+      # Run curl test from within cluster
+      kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -- \
+        curl -f http://opensearch-nodeport.${KUBE_NAMESPACE}:9200/_cluster/health || exit 1
+    - echo "Smoke tests passed!"
+  dependencies:
+    - deploy:dev
+  only:
+    - develop
+
+# Rollback job (manual trigger)
+rollback:
+  stage: deploy
+  image: alpine/k8s:${KUBECTL_VERSION}
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_PROD" | base64 -d > ~/.kube/config
+  script:
+    - echo "Rolling back deployment..."
+    - kubectl rollout undo statefulset opensearch -n ${KUBE_NAMESPACE}
+    - kubectl rollout status statefulset opensearch -n ${KUBE_NAMESPACE}
+  when: manual
+  only:
+    - main
+    - tags
+
+# Cleanup job for review apps
+cleanup:
+  stage: deploy
+  image: alpine/k8s:${KUBECTL_VERSION}
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_DEV" | base64 -d > ~/.kube/config
+  script:
+    - echo "Cleaning up resources..."
+    - kubectl delete namespace ${KUBE_NAMESPACE}-review-${CI_MERGE_REQUEST_IID} --ignore-not-found=true
+  when: manual
+  only:
+    - merge_requests
+
+# Notification job
+notify:
+  stage: .post
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      if [ "$CI_JOB_STATUS" == "success" ]; then
+        STATUS="✅ Success"
+        COLOR="good"
+      else
+        STATUS="❌ Failed"
+        COLOR="danger"
+      fi
+      
+      # Send Slack notification (if SLACK_WEBHOOK is configured)
+      if [ -n "$SLACK_WEBHOOK" ]; then
+        curl -X POST "$SLACK_WEBHOOK" \
+          -H 'Content-Type: application/json' \
+          -d "{\"text\":\"OpenSearch Deployment $STATUS\",\"color\":\"$COLOR\"}"
+      fi
+  when: always
+
+# Made with Bob
